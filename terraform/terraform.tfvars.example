@@ -1,0 +1,19 @@
+# Copia este archivo a terraform.tfvars y rellena los valores REALES.
+# terraform.tfvars contiene SECRETS → está en .gitignore, NUNCA lo subas al repo.
+
+subscription_id = "00000000-0000-0000-0000-000000000000" # az account show --query id -o tsv
+
+# Las 2 bases de datos externas (las mismas que ya usas):
+redis_url = "rediss://default:TU_TOKEN@premium-bug-139445.upstash.io:6379" # gateway/.env
+mongo_url = "mongodb+srv://battlecaos:TU_PASSWORD@cluster0.5puigry.mongodb.net/?retryWrites=true&w=majority" # auth/.env
+
+# Mismo JWT_SECRET que tienes en battlecaos-gateway/.env (auth firma, gateway verifica):
+jwt_secret = "PEGA_AQUI_TU_JWT_SECRET_DE_32+_CARACTERES"
+
+# Client ID de Google OAuth (frontend/.env → VITE_GOOGLE_CLIENT_ID):
+google_client_id = "523776151024-xxxx.apps.googleusercontent.com"
+
+# Opcionales:
+# location         = "eastus"
+# gateway_replicas = 3
+# image_tag        = "v1"

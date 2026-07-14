@@ -1,0 +1,97 @@
+name: Build & Push Docker Image (reusable)
+
+# Workflow REUSABLE: la lógica de "construir la imagen Docker y subirla al ACR
+# del ambiente" vive AQUÍ una sola vez. Cada uno de los 9 repos de microservicios
+# tiene un workflow delgado (5-10 líneas) que lo invoca con `uses:` — así cada
+# repo mantiene su PROPIO pipeline independiente (se dispara solo cuando ESE
+# repo cambia) sin duplicar la lógica de build 9 veces.
+#
+# `actions/checkout` dentro de este job checkea el código del repo que LLAMA
+# (no el de battlecaos-infra), así que compila el Dockerfile de cada servicio.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Nombre corto del servicio (gateway, auth, room, game, chat, timer, bot, observability, frontend)"
+        required: true
+        type: string
+      environment:
+        description: "Ambiente destino: dev | test | prod — determina el resource group/ACR"
+        required: false
+        type: string
+        default: dev
+      build-args:
+        description: "Build args extra, uno por línea (KEY=VALUE) — normalmente vacío, salvo casos especiales"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    name: build & push · ${{ inputs.service }} → ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # La credencial federada de este servicio confía en
+      # repo:BattleCaos-Ship/battlecaos-<service>:ref:refs/heads/main
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolver el ACR del ambiente (por resource group, nombre determinístico)
+        id: acr
+        run: |
+          RG="battlecaos${{ inputs.environment }}-rg"
+          NAME=$(az acr list -g "$RG" --query "[0].name" -o tsv)
+          if [ -z "$NAME" ]; then
+            echo "::error::No encontré un ACR en el resource group $RG. ¿Ya corriste terraform apply para ese ambiente? (ver DESPLIEGUE.md §A.3)"
+            exit 1
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "ACR resuelto: $NAME (resource group: $RG)"
+
+      # Caso especial: el frontend necesita las URLs REALES de gateway/auth
+      # horneadas en el build de Vite. En vez de depender de outputs de
+      # Terraform entre repos (acoplamiento cruzado), las resolvemos aquí
+      # consultando Azure directamente — el nombre del Container App también
+      # es determinístico (${prefix}-gateway / ${prefix}-auth).
+      - name: Resolver URLs de gateway/auth (solo para el frontend)
+        id: urls
+        if: inputs.service == 'frontend'
+        run: |
+          RG="battlecaos${{ inputs.environment }}-rg"
+          GW=$(az containerapp show -n "battlecaos${{ inputs.environment }}-gateway" -g "$RG" --query "properties.configuration.ingress.fqdn" -o tsv)
+          AUTH=$(az containerapp show -n "battlecaos${{ inputs.environment }}-auth" -g "$RG" --query "properties.configuration.ingress.fqdn" -o tsv)
+          if [ -z "$GW" ] || [ -z "$AUTH" ]; then
+            echo "::error::No encontré gateway/auth desplegados en $RG. Despliega el resto de servicios ANTES del frontend (ver DESPLIEGUE.md §A.6)."
+            exit 1
+          fi
+          echo "gateway-url=https://$GW" >> "$GITHUB_OUTPUT"
+          echo "auth-url=https://$AUTH" >> "$GITHUB_OUTPUT"
+          echo "gateway: https://$GW · auth: https://$AUTH"
+
+      - name: Construir y subir la imagen (ACR Tasks — compila EN Azure, no en el runner)
+        run: |
+          ARGS=()
+          if [ "${{ inputs.service }}" = "frontend" ]; then
+            ARGS+=(--build-arg "VITE_GATEWAY_URL=${{ steps.urls.outputs.gateway-url }}")
+            ARGS+=(--build-arg "VITE_AUTH_URL=${{ steps.urls.outputs.auth-url }}")
+            ARGS+=(--build-arg "VITE_GOOGLE_CLIENT_ID=${{ secrets.GOOGLE_CLIENT_ID }}")
+          fi
+          while IFS= read -r line; do
+            [ -n "$line" ] && ARGS+=(--build-arg "$line")
+          done <<< "${{ inputs.build-args }}"
+
+          az acr build \
+            --registry "${{ steps.acr.outputs.name }}" \
+            --image "battlecaos-${{ inputs.service }}:${{ inputs.environment }}" \
+            "${ARGS[@]}" \
+            .
