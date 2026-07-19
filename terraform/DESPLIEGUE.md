@@ -55,27 +55,55 @@ imágenes Docker de cada microservicio** (§E).
 - [x] `terraform.tfvars` recreado y corregido en `battlecaos-infra/terraform/`
       (con el `subscription_id` real — el archivo viejo tenía un placeholder)
 
+### 🚀 DEV DESPLEGADO (2026-07-14) — las 11 apps `Running` en Azure
+
+| Recurso | URL / nombre |
+|---|---|
+| **Frontend (el juego)** | https://battlecaosdev-frontend.victoriousriver-7e24b629.eastus2.azurecontainerapps.io |
+| Gateway (WebSocket) | https://battlecaosdev-gateway.victoriousriver-7e24b629.eastus2.azurecontainerapps.io |
+| Auth (login) | https://battlecaosdev-auth.victoriousriver-7e24b629.eastus2.azurecontainerapps.io |
+| ACR | `battlecaosdevacr52f56b.azurecr.io` |
+| Internos | kafka, redis, room, game, chat, timer, bot, observability |
+
+Notas del despliegue real (difieren del plan original):
+- **`az acr build` NO sirve en Azure for Students** (`TasksOperationsNotAllowed`):
+  las imágenes se construyen local con Docker y se suben con `docker push`
+  (§A.4 ya está corregido; el workflow reusable de CI también).
+- **`bitnami/kafka` ya no existe en Docker Hub** (Broadcom la retiró): se usa
+  la oficial `apache/kafka:3.7.0` (main.tf ya actualizado, vars `KAFKA_*`).
+- En esta máquina az CLI se colgaba por **WMI averiado** + **IPv6 roto en la
+  red**: el despliegue usó un shim parcheado (ver "Problemas de esta máquina"
+  al final de esta sección).
+
 ### Pendiente — EN ESTE ORDEN
 
-1. **[TÚ] Commitear y pushear** los cambios pendientes en los 9 repos de
-   microservicios (`battlecaos-gateway`, `-auth`, `-room`, `-game`, `-chat`,
-   `-timer`, `-bot`, `-observability`, `-frontend`) — cada uno tiene trabajo de
-   sesiones anteriores sin subir, MÁS el `.github/workflows/build.yml` nuevo
-   de cada repo. Sin el push, esos workflows no existen para GitHub todavía.
-2. **[TÚ] En GitHub, en CADA uno de los 9 repos de microservicios**: agregar
+1. **[TÚ] Google OAuth**: en Google Cloud Console → tu OAuth Client →
+   *Authorized JavaScript origins* → agrega la URL del frontend (arriba).
+   Sin esto el botón de "entrar con Google" fallará en el juego desplegado.
+2. **[TÚ] Commitear y pushear** los cambios pendientes en los 9 repos de
+   microservicios + `battlecaos-infra` (incluye los `.dockerignore` nuevos,
+   el fix del workflow reusable y el `main.tf` con kafka oficial).
+3. **[TÚ] En GitHub, en CADA uno de los 9 repos de microservicios**: agregar
    los secrets `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/`AZURE_SUBSCRIPTION_ID`
    (y `GOOGLE_CLIENT_ID` solo en `battlecaos-frontend`) — ver la tabla exacta
    en §E. Sin esto, el build.yml de cada repo no puede autenticarse con Azure.
-3. **[TÚ] En GitHub, en `battlecaos-infra`**: crear los 3 *Environments*
+4. **[TÚ] En GitHub, en `battlecaos-infra`**: crear los 3 *Environments*
    (`dev`, `test`, `production`) y los 7 *Repository secrets* del pipeline de
-   infraestructura — ver la lista exacta en §B. Sin esto el pipeline de
-   infraestructura no puede correr un `apply` real (fallará el login a Azure).
-4. **§A.2** — repetir `terraform init -backend-config=environments/dev.backend.hcl`
-   (borré la carpeta `.terraform/` de prueba al limpiar; se regenera en segundos).
-5. **§A.3 — AQUÍ EMPIEZA LO NUEVO DE VERDAD**: `terraform apply -target=...` para
-   crear el ACR. Ningún recurso de aplicación existe todavía en Azure (lo verifiqué:
-   `az group exists -n battlecaosdev-rg` → `false`).
-7. **§A.4 en adelante**: construir imágenes → desplegar → frontend → ajustes finales.
+   infraestructura — ver la lista exacta en §B.
+5. Ambientes `test` y `prod`: repetir §A con sus `.tfvars` (o dejar que el
+   pipeline de GitHub Actions lo haga tras el paso 4).
+
+### ⚠️ Problemas de ESTA máquina (para despliegues manuales futuros)
+
+Dos averías locales hacían que az/terraform se "colgaran para siempre":
+1. **WMI averiado**: cualquier `platform.uname()` de Python (que az usa) se
+   congela. Arreglo permanente (PowerShell como admin):
+   `winmgmt /verifyrepository` y si sale inconsistente `winmgmt /salvagerepository`.
+2. **IPv6 roto en la red**: los SYN a direcciones IPv6 se pierden sin respuesta;
+   Python espera el timeout completo (el navegador no, por happy-eyeballs).
+El despliegue se hizo con un **shim del az CLI** (clon de python + parche que
+fuerza IPv4 y evita WMI). Si az vuelve a colgarse en una terminal normal, esa
+es la causa — no es Azure ni el proyecto.
 
 ---
 
@@ -126,12 +154,17 @@ $ACR = terraform output -raw acr_name
 
 ### 4. Construir y subir las imágenes de backend
 
-`az acr build` compila **en la nube** (no necesitas Docker corriendo local):
+> ⚠️ **`az acr build` NO funciona en Azure for Students** (error
+> `TasksOperationsNotAllowed`: Microsoft bloquea ACR Tasks en suscripciones de
+> estudiante). Se construye **local con Docker** y se sube con push:
 
 ```powershell
 cd ..
+az acr credential show --name $ACR --query "passwords[0].value" -o tsv |
+  docker login "$ACR.azurecr.io" -u $ACR --password-stdin
 foreach ($s in 'gateway','auth','room','game','chat','timer','bot','observability') {
-  az acr build -r $ACR -t "battlecaos-${s}:dev" "battlecaos-$s"
+  docker build -t "$ACR.azurecr.io/battlecaos-${s}:dev" "battlecaos-$s"
+  docker push  "$ACR.azurecr.io/battlecaos-${s}:dev"
 }
 ```
 
@@ -152,11 +185,12 @@ terraform output   # ← anota gateway_url y auth_url
 cd ..
 $GW   = terraform -chdir=terraform output -raw gateway_url
 $AUTH = terraform -chdir=terraform output -raw auth_url
-az acr build -r $ACR -t battlecaos-frontend:dev `
+docker build -t "$ACR.azurecr.io/battlecaos-frontend:dev" `
   --build-arg VITE_GATEWAY_URL=$GW `
   --build-arg VITE_AUTH_URL=$AUTH `
   --build-arg VITE_GOOGLE_CLIENT_ID=TU_CLIENT_ID.apps.googleusercontent.com `
   battlecaos-frontend
+docker push "$ACR.azurecr.io/battlecaos-frontend:dev"
 
 cd terraform
 terraform apply -var-file=environments/dev.tfvars -var="deploy_frontend=true"
@@ -227,8 +261,8 @@ Pull Request → fmt/validate (calidad) → plan (impacto visible, comentado en 
 3. **Primera vez**: como el frontend necesita 2 pasadas (§A.6), el workflow por
    defecto NO lo despliega (`deploy_frontend=false` en cada `environments/*.tfvars`).
    Tras el primer `apply` exitoso de cada ambiente, construye la imagen del frontend
-   con `az acr build` (igual que en §A.6) y cambia `deploy_frontend = true` en el
-   `.tfvars` de ese ambiente en un nuevo PR.
+   con `docker build` + `push` (igual que en §A.6) y cambia `deploy_frontend = true`
+   en el `.tfvars` de ese ambiente en un nuevo PR.
 
 ### Cómo se usa, en la práctica
 
@@ -308,8 +342,10 @@ archivo delgado (`build.yml`) de ~10 líneas que lo invoca con
    la misma identidad/App Registration) y resuelve el ACR del ambiente **por el
    nombre del resource group** (`battlecaosdev-rg`, determinístico), sin
    necesitar leer el estado de Terraform desde otro repo.
-3. `az acr build` compila la imagen **en Azure** (ACR Tasks) y la sube como
-   `battlecaos-<servicio>:<ambiente>` (ej. `battlecaos-game:dev`).
+3. `docker build` compila la imagen **en el runner** y `docker push` la sube como
+   `battlecaos-<servicio>:<ambiente>` (ej. `battlecaos-game:dev`). (Antes usaba
+   `az acr build`/ACR Tasks, pero Azure for Students lo bloquea —
+   `TasksOperationsNotAllowed`.)
 4. **Caso especial — frontend**: además resuelve las URLs reales de `gateway`/
    `auth` consultando sus Container Apps ya desplegados (mismo truco de nombre
    determinístico) y las pasa como build-args de Vite automáticamente. Por eso

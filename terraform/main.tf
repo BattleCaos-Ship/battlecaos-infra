@@ -45,6 +45,14 @@ resource "azurerm_container_app_environment" "env" {
   resource_group_name        = azurerm_resource_group.rg.name
   location                   = azurerm_resource_group.rg.location
   log_analytics_workspace_id = azurerm_log_analytics_workspace.logs.id
+
+  # Redundancia de ZONA (OPT-IN, DESTRUCTIVO): el provider exige `zone_redundancy_enabled` e
+  # `infrastructure_subnet_id` juntos o ninguno → NO se puede gate con variable aquí sin romper
+  # el plan por defecto. Para activarla, DESCOMENTA las 2 líneas de abajo (y pon
+  # enable_zone_redundancy=true para crear la VNet/subred de zone-redundancy.tf). Recrea el env
+  # y TODAS las apps → solo en ventana de mantenimiento. Ver deploy/HA-RONDA-B-APPLY.md.
+  # infrastructure_subnet_id = azurerm_subnet.aca[0].id
+  # zone_redundancy_enabled  = true
 }
 
 # ── Kafka (interno) ───────────────────────────────────────────────────────────
@@ -52,7 +60,16 @@ resource "azurerm_container_app_environment" "env" {
 # como battlecaos-kafka:9092. Nota: almacenamiento efímero — si el contenedor se
 # reinicia se pierden mensajes en vuelo; aceptable porque los topics transportan
 # comandos/eventos transitorios (el ESTADO vive en Redis/Atlas).
+# Broker ÚNICO (kafka_brokers=1, default). Con kafka_brokers=3 se apaga (count=0) y lo
+# reemplaza el clúster de kafka-cluster.tf. El `moved` evita recrear el broker actual al
+# introducir el count (renombra kafka → kafka[0] en el estado sin destruir/crear).
+moved {
+  from = azurerm_container_app.kafka
+  to   = azurerm_container_app.kafka[0]
+}
+
 resource "azurerm_container_app" "kafka" {
+  count                        = var.kafka_brokers == 1 ? 1 : 0
   name                         = "${var.prefix}-kafka"
   container_app_environment_id = azurerm_container_app_environment.env.id
   resource_group_name          = azurerm_resource_group.rg.name
@@ -74,46 +91,66 @@ resource "azurerm_container_app" "kafka" {
     max_replicas = 1 # broker con identidad: NO se escala horizontalmente así
 
     container {
-      name   = "kafka"
-      image  = "bitnami/kafka:3.7"
+      name = "kafka"
+      # apache/kafka = imagen OFICIAL del proyecto (la de bitnami fue retirada
+      # de Docker Hub por Broadcom en 2025 → MANIFEST_UNKNOWN al desplegar).
+      # Mismo modo KRaft; las vars cambian de prefijo KAFKA_CFG_* → KAFKA_*.
+      image  = "apache/kafka:3.7.0"
       cpu    = 0.75
       memory = "1.5Gi"
 
       env {
-        name  = "KAFKA_CFG_NODE_ID"
+        name  = "KAFKA_NODE_ID"
         value = "0"
       }
       env {
-        name  = "KAFKA_CFG_PROCESS_ROLES"
+        name  = "KAFKA_PROCESS_ROLES"
         value = "controller,broker"
       }
       env {
-        name  = "KAFKA_CFG_CONTROLLER_QUORUM_VOTERS"
+        name  = "KAFKA_CONTROLLER_QUORUM_VOTERS"
         value = "0@127.0.0.1:9093"
       }
       env {
-        name  = "KAFKA_CFG_LISTENERS"
+        name  = "KAFKA_LISTENERS"
         value = "PLAINTEXT://:9092,CONTROLLER://:9093"
       }
       env {
-        name  = "KAFKA_CFG_ADVERTISED_LISTENERS"
+        name  = "KAFKA_ADVERTISED_LISTENERS"
         value = "PLAINTEXT://${var.prefix}-kafka:9092"
       }
       env {
-        name  = "KAFKA_CFG_CONTROLLER_LISTENER_NAMES"
+        name  = "KAFKA_CONTROLLER_LISTENER_NAMES"
         value = "CONTROLLER"
       }
       env {
-        name  = "KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP"
+        name  = "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP"
         value = "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
       }
       env {
-        name  = "KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE"
+        name  = "KAFKA_AUTO_CREATE_TOPICS_ENABLE"
         value = "true"
       }
+      # Particiones por defecto para los topics auto-creados: 6 → permite repartir el
+      # trabajo entre varias réplicas de los servicios de dominio (autoescalado KEDA).
+      # Como todo va keyed por `codigo`, cada sala queda confinada a UNA partición y se
+      # procesa en orden; distintas salas se distribuyen entre réplicas.
       env {
-        name  = "ALLOW_PLAINTEXT_LISTENER"
-        value = "yes"
+        name  = "KAFKA_NUM_PARTITIONS"
+        value = "6"
+      }
+      # Broker único: los topics internos no pueden pedir réplicas > 1.
+      env {
+        name  = "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR"
+        value = "1"
+      }
+      env {
+        name  = "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR"
+        value = "1"
+      }
+      env {
+        name  = "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR"
+        value = "1"
       }
     }
   }

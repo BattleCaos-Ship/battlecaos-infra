@@ -78,8 +78,13 @@ jobs:
           echo "auth-url=https://$AUTH" >> "$GITHUB_OUTPUT"
           echo "gateway: https://$GW · auth: https://$AUTH"
 
-      - name: Construir y subir la imagen (ACR Tasks — compila EN Azure, no en el runner)
+      # NOTA: `az acr build` (ACR Tasks) está BLOQUEADO en suscripciones
+      # Azure for Students (error TasksOperationsNotAllowed), así que la imagen
+      # se construye EN el runner con docker y se sube con push normal.
+      - name: Construir y subir la imagen (docker build en el runner + push al ACR)
         run: |
+          az acr login --name "${{ steps.acr.outputs.name }}"
+
           ARGS=()
           if [ "${{ inputs.service }}" = "frontend" ]; then
             ARGS+=(--build-arg "VITE_GATEWAY_URL=${{ steps.urls.outputs.gateway-url }}")
@@ -90,8 +95,6 @@ jobs:
             [ -n "$line" ] && ARGS+=(--build-arg "$line")
           done <<< "${{ inputs.build-args }}"
 
-          az acr build \
-            --registry "${{ steps.acr.outputs.name }}" \
-            --image "battlecaos-${{ inputs.service }}:${{ inputs.environment }}" \
-            "${ARGS[@]}" \
-            .
+          IMAGE="${{ steps.acr.outputs.name }}.azurecr.io/battlecaos-${{ inputs.service }}:${{ inputs.environment }}"
+          docker build -t "$IMAGE" "${ARGS[@]}" .
+          docker push "$IMAGE"

@@ -14,7 +14,7 @@ locals {
 
   # Variables comunes a todos los servicios de backend.
   common_env = [
-    { name = "KAFKA_BROKER", value = "${var.prefix}-kafka:9092", secret = null },
+    { name = "KAFKA_BROKER", value = local.kafka_bootstrap, secret = null },
     # Primario RÁPIDO = Redis interno de Azure (co-ubicado, ~1ms). Respaldo DURABLE = Upstash
     # (réplica ASÍNCRONA en segundo plano). Así la ruta caliente no espera al Upstash remoto.
     { name = "REDIS_URL", value = "redis://${var.prefix}-redis:6379", secret = null },
@@ -30,7 +30,25 @@ locals {
     timer         = []
     bot           = []
     observability = [{ name = "MONGO_URL", value = null, secret = "mongo-url" }]
+    # Chat de voz (WebRTC P2P): solo orquesta el canal (Kafka/Redis), no transporta audio.
+    # VOICE_ICE_SERVERS opcional (JSON con TURN); sin él usa STUN por defecto.
+    voice-channel = []
   }
+
+  # Servicios que es SEGURO escalar horizontalmente por lag de Kafka: consumen comandos
+  # keyed por `codigo` de sala → distintas salas se reparten entre réplicas sin desorden,
+  # y una misma sala sigue procesándose en orden en una sola partición. `timer` (leader
+  # election, ve todo el stream), `bot` (fan-out) y `observability` (agrega global) NO
+  # se escalan así — quedan en 1 réplica.
+  scalable = {
+    game          = "cmd.game"
+    room          = "cmd.room"
+    chat          = "cmd.chat"
+    voice-channel = "cmd.voice"
+  }
+
+  # Puerto donde cada servicio interno expone /health y /metrics (observability.js).
+  obs_port = 9100
 }
 
 # ── Servicios de dominio (room, game, chat, timer, bot, observability) ────────
@@ -62,17 +80,48 @@ resource "azurerm_container_app" "backend" {
   }
 
   template {
-    # 1 réplica por servicio: los topics se auto-crean con 1 partición, así que más
-    # réplicas del mismo consumer group no reciben trabajo extra. Para escalar de
-    # verdad: subir particiones de cmd.game y aquí min/max_replicas.
+    # AUTOESCALADO por lag de Kafka (KEDA) en los servicios seguros de escalar: min 1
+    # (mismo costo en reposo que antes) / max 3 (sube solo bajo carga). El resto: 1 fija.
     min_replicas = 1
-    max_replicas = 1
+    max_replicas = contains(keys(local.scalable), each.key) ? 3 : 1
+
+    # Regla de escalado KEDA por lag del consumer group de Kafka. Solo para los servicios
+    # de local.scalable; sube una réplica por cada `lagThreshold` mensajes acumulados.
+    dynamic "custom_scale_rule" {
+      for_each = contains(keys(local.scalable), each.key) ? [1] : []
+      content {
+        name             = "kafka-lag"
+        custom_rule_type = "kafka"
+        # Kafka interno PLAINTEXT sin auth → sasl/tls deshabilitados en metadata (sin
+        # bloque authentication, que exigiría un secret de TriggerAuthentication).
+        metadata = {
+          bootstrapServers   = local.kafka_bootstrap
+          consumerGroup      = "${each.key == "voice-channel" ? "voice" : each.key}-group"
+          topic              = local.scalable[each.key]
+          lagThreshold       = "50"
+          offsetResetPolicy  = "latest"
+          allowIdleConsumers = "true"
+          sasl               = "none"
+          tls                = "disable"
+        }
+      }
+    }
 
     container {
       name   = each.key
       image  = "${local.registry_server}/battlecaos-${each.key}:${var.image_tag}"
       cpu    = 0.25
       memory = "0.5Gi"
+
+      # Nombre del servicio (prefijo de métricas) y puerto de observabilidad.
+      env {
+        name  = "SERVICE_NAME"
+        value = each.key
+      }
+      env {
+        name  = "OBS_PORT"
+        value = tostring(local.obs_port)
+      }
 
       dynamic "env" {
         for_each = concat(local.common_env, each.value)
@@ -81,6 +130,26 @@ resource "azurerm_container_app" "backend" {
           value       = env.value.value
           secret_name = env.value.secret
         }
+      }
+
+      # Liveness probe sobre /health: si el proceso se cuelga (no solo si muere), Azure
+      # reemplaza la réplica. Usa la redundancia de Redis: /health da 200 mientras haya
+      # al menos un nodo vivo.
+      liveness_probe {
+        transport = "HTTP"
+        port      = local.obs_port
+        path      = "/health"
+        interval_seconds  = 15
+        timeout           = 3
+        failure_count_threshold = 3
+      }
+      readiness_probe {
+        transport = "HTTP"
+        port      = local.obs_port
+        path      = "/health"
+        interval_seconds  = 10
+        timeout           = 3
+        failure_count_threshold = 3
       }
     }
   }
@@ -91,16 +160,29 @@ resource "azurerm_container_app" "gateway" {
   name                         = "${var.prefix}-gateway"
   container_app_environment_id = azurerm_container_app_environment.env.id
   resource_group_name          = azurerm_resource_group.rg.name
-  revision_mode                = "Single"
+  # MULTIPLE revision mode → una revisión nueva NACE con 0% de tráfico (el primitivo de canary):
+  # se despliega "a oscuras", se le manda un % pequeño, se observa y se promueve o se revierte.
+  # En Single mode, cada deploy iba a 100% al instante (un deploy malo = caída total inmediata).
+  revision_mode = "Multiple"
 
   ingress {
     external_enabled = true
     target_port      = 3000
     transport        = "auto" # HTTP + upgrade a WebSocket
+    # Valor inicial (para crear el recurso desde cero). En operación el SPLIT de tráfico lo
+    # gobierna el pipeline de canary vía az (por peso de revisión), no Terraform: por eso
+    # 'traffic_weight' está en ignore_changes abajo → Terraform NO revierte un canary en curso.
     traffic_weight {
       latest_revision = true
       percentage      = 100
     }
+  }
+
+  # El split de tráfico es responsabilidad del pipeline de canary (tools/deploy/canary.ps1),
+  # no de Terraform. Sin esto, cada `terraform apply` forzaría 'latest=100%' y anularía el
+  # canary (o la revisión estable elegida) que el pipeline haya dejado sirviendo.
+  lifecycle {
+    ignore_changes = [ingress[0].traffic_weight]
   }
 
   secret {
@@ -126,6 +208,16 @@ resource "azurerm_container_app" "gateway" {
     min_replicas = var.gateway_replicas # ← los "3 gateways"
     max_replicas = var.gateway_replicas + 2
 
+    # AUTOESCALADO explícito por CONEXIONES CONCURRENTES (no por CPU). El gateway sirve
+    # WebSockets de larga vida: la señal correcta de saturación es cuántos sockets sostiene
+    # cada réplica, no su CPU (que puede estar baja mientras miles de conexiones esperan). Sin
+    # esta regla, Container Apps usaba el escalador HTTP por defecto (10 conc/réplica) — demasiado
+    # agresivo para WS. Aquí sube una réplica por cada `gateway_scale_concurrency` conexiones.
+    http_scale_rule {
+      name                = "sockets-concurrentes"
+      concurrent_requests = tostring(var.gateway_scale_concurrency)
+    }
+
     container {
       name   = "gateway"
       image  = "${local.registry_server}/battlecaos-gateway:${var.image_tag}"
@@ -146,7 +238,7 @@ resource "azurerm_container_app" "gateway" {
       }
       env {
         name  = "KAFKA_BROKER"
-        value = "${var.prefix}-kafka:9092"
+        value = local.kafka_bootstrap
       }
       env {
         name        = "JWT_SECRET"
@@ -155,6 +247,27 @@ resource "azurerm_container_app" "gateway" {
       env {
         name  = "CLIENT_ORIGIN"
         value = "*"
+      }
+
+      # Probes sobre /health (puerto 3000, el mismo del ingress WebSocket). /health ahora
+      # verifica Redis Y la salud del consumer de Kafka: si el consumer se cuelga (deja de
+      # entregar broadcasts a los clientes), devuelve 503 y Azure reinicia la réplica. La
+      # readiness saca la réplica del balanceador mientras arranca o si queda degradada.
+      liveness_probe {
+        transport               = "HTTP"
+        port                    = 3000
+        path                    = "/health"
+        interval_seconds        = 15
+        timeout                 = 3
+        failure_count_threshold = 3
+      }
+      readiness_probe {
+        transport               = "HTTP"
+        port                    = 3000
+        path                    = "/health"
+        interval_seconds        = 10
+        timeout                 = 3
+        failure_count_threshold = 3
       }
     }
   }
@@ -237,6 +350,24 @@ resource "azurerm_container_app" "auth" {
       env {
         name  = "CLIENT_ORIGIN"
         value = "*"
+      }
+
+      # Probes sobre /health (puerto 3001). auth no consume Kafka → basta con el ping a Redis.
+      liveness_probe {
+        transport               = "HTTP"
+        port                    = 3001
+        path                    = "/health"
+        interval_seconds        = 15
+        timeout                 = 3
+        failure_count_threshold = 3
+      }
+      readiness_probe {
+        transport               = "HTTP"
+        port                    = 3001
+        path                    = "/health"
+        interval_seconds        = 10
+        timeout                 = 3
+        failure_count_threshold = 3
       }
     }
   }

@@ -5,6 +5,9 @@
 
 environment      = "dev"
 prefix           = "battlecaosdev"
-gateway_replicas = 1     # dev no necesita alta disponibilidad — 1 réplica basta
+gateway_replicas = 2     # activo/activo REAL en reposo: si una réplica cae, la otra sigue
+                         # sirviendo sin gap (antes min=1: la probe recreaba, pero con un
+                         # hueco de segundos). Decidido 2026-07-18 al cerrar disponibilidad.
 image_tag        = "dev" # las imágenes de dev se etiquetan :dev (última construida)
-deploy_frontend  = false # activar en la 2ª pasada, cuando la imagen del frontend ya exista
+deploy_frontend  = true  # el frontend YA está desplegado → true evita que `terraform apply` lo destruya
+                         # (con false, terraform lo daba de baja: trampa que mordía en cada apply)

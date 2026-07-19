@@ -1,0 +1,70 @@
+name: CI — Tests + Cobertura + Sonar (reusable)
+
+# Workflow REUSABLE de CALIDAD: tests unitarios + cobertura (lcov) + análisis SonarQube.
+# Cada repo de servicio lo invoca desde su ci.yml (en PRs y ramas feature) y desde su
+# build.yml (como GATE: sin tests verdes NO hay build/deploy).
+#
+# Sonar es OPCIONAL: el paso solo corre si el secret SONAR_TOKEN existe en el repo que
+# llama (con `secrets: inherit`). Sin el secret, el CI sigue siendo tests + cobertura.
+#   - SonarCloud:  SONAR_TOKEN + SONAR_HOST_URL=https://sonarcloud.io (y sonar.organization
+#     en el sonar-project.properties del repo).
+#   - SonarQube self-hosted: SONAR_TOKEN + SONAR_HOST_URL=<tu servidor accesible>.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Nombre corto del servicio (para el artifact de cobertura)"
+        required: true
+        type: string
+      node-version:
+        required: false
+        type: string
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests + cobertura · ${{ inputs.service }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # historial completo → Sonar atribuye bien el "new code"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Tests unitarios
+        run: npm test
+
+      - name: Cobertura (lcov para Sonar + html navegable)
+        run: npm run coverage
+
+      - name: Publicar cobertura como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ inputs.service }}
+          path: coverage/
+          retention-days: 7
+
+      # ── Sonar (solo si el secret existe — inofensivo si no) ────────────────
+      - name: ¿Sonar configurado?
+        id: sonar
+        env:
+          TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: echo "on=$([ -n "$TOKEN" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Análisis SonarQube
+        if: steps.sonar.outputs.on == 'true'
+        uses: SonarSource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
