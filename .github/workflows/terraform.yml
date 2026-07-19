@@ -1,0 +1,158 @@
+name: Terraform CI/CD — BattleCaos
+
+# Flujo (mapea al pipeline pedido): Pull Request → fmt/validate → plan (comentado
+# en el PR) → approval (Required reviewers de los GitHub Environments test/production)
+# → apply. En push a main se promueve dev → test → prod EN SECUENCIA.
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["terraform/**"]
+  push:
+    branches: [main]
+    paths: ["terraform/**"]
+  workflow_dispatch: {} # permite disparar manualmente todo el flujo de apply
+
+permissions:
+  id-token: write      # requerido por azure/login (OIDC, sin client-secret)
+  contents: read
+  pull-requests: write # para comentar el plan en el PR
+
+env:
+  TF_VERSION: "1.15.8"
+  TF_VAR_redis_url: ${{ secrets.REDIS_URL }}
+  TF_VAR_mongo_url: ${{ secrets.MONGO_URL }}
+  TF_VAR_jwt_secret: ${{ secrets.JWT_SECRET }}
+  TF_VAR_google_client_id: ${{ secrets.GOOGLE_CLIENT_ID }}
+
+jobs:
+  # ── Calidad de código: fmt + validate (corre SIEMPRE, sin tocar Azure) ────────
+  fmt-validate:
+    name: fmt & validate
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: terraform } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: ${{ env.TF_VERSION }} }
+      - name: terraform fmt (verifica estilo, no aplica cambios)
+        run: terraform fmt -check -recursive
+      - name: terraform init (sin backend — solo para validar sintaxis)
+        run: terraform init -backend=false
+      - name: terraform validate
+        run: terraform validate
+
+  # ── PR: plan de DEV, se comenta en el Pull Request (impacto visible) ─────────
+  plan-pr:
+    name: plan (dev) — comentado en el PR
+    if: github.event_name == 'pull_request'
+    needs: fmt-validate
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: terraform } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: ${{ env.TF_VERSION }} }
+
+      # Sin `environment:` en este job → el token OIDC pide el subject
+      # repo:<owner>/<repo>:pull_request, que coincide con la credencial federada "fc-pr".
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - run: terraform init -backend-config=environments/dev.backend.hcl
+      - name: terraform plan
+        id: plan
+        run: |
+          terraform plan -var-file=environments/dev.tfvars -no-color -out=tfplan | tee plan.txt
+          echo "exitcode=$?" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Comentar el plan en el Pull Request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan.txt', 'utf8').slice(-60000);
+            const marker = '<!-- battlecaos-tf-plan -->';
+            const body = `${marker}\n### 📋 Terraform Plan — ambiente \`dev\`\n<details><summary>Ver plan completo</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
+            }
+
+      - name: Fallar el job si el plan falló (el comentario ya quedó publicado)
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1
+
+  # ── Promoción dev → test → prod (solo al hacer merge a main) ─────────────────
+  # Cada job usa su GitHub Environment: la aprobación humana ("Required reviewers")
+  # se configura en Settings → Environments de este repo (test y production deben
+  # tenerla; dev normalmente no, para que despliegue solo tras el merge).
+  deploy-dev:
+    name: deploy · dev
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: fmt-validate
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency: { group: terraform-dev, cancel-in-progress: false }
+    defaults: { run: { working-directory: terraform } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: ${{ env.TF_VERSION }} }
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - run: terraform init -backend-config=environments/dev.backend.hcl
+      - run: terraform plan -var-file=environments/dev.tfvars -out=tfplan
+      - run: terraform apply -auto-approve tfplan
+
+  deploy-test:
+    name: deploy · test
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: test
+    concurrency: { group: terraform-test, cancel-in-progress: false }
+    defaults: { run: { working-directory: terraform } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: ${{ env.TF_VERSION }} }
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - run: terraform init -backend-config=environments/test.backend.hcl
+      - run: terraform plan -var-file=environments/test.tfvars -out=tfplan
+      - run: terraform apply -auto-approve tfplan
+
+  deploy-prod:
+    name: deploy · production
+    needs: deploy-test
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency: { group: terraform-prod, cancel-in-progress: false }
+    defaults: { run: { working-directory: terraform } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: ${{ env.TF_VERSION }} }
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - run: terraform init -backend-config=environments/prod.backend.hcl
+      - run: terraform plan -var-file=environments/prod.tfvars -out=tfplan
+      - run: terraform apply -auto-approve tfplan
