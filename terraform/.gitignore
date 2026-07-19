@@ -1,0 +1,11 @@
+# Estado y secrets de Terraform — NUNCA al repo.
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+
+# Solo el tfvars de uso LOCAL/manual (con secrets reales) se ignora. Los tfvars de
+# environments/ NO llevan secrets (esos van vía TF_VAR_* en CI) — SÍ se versionan.
+/terraform.tfvars
+!terraform.tfvars.example
+!environments/*.tfvars

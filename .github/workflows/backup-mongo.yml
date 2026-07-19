@@ -1,0 +1,46 @@
+name: Backup diario de Mongo (DR)
+
+# Cumple el RPO de 24 h definido en deploy/DR.md: cada día hace un mongodump de la base
+# durable (usuarios + partidas) y lo sube como ARTIFACT (retención 30 días). Antes el backup
+# estaba PROBADO pero era manual; esto lo automatiza sin costo (Actions gratis en repos públicos).
+#
+# Requiere en Settings → Secrets del repo: MONGO_URL (ya usado por terraform.yml).
+# Restauración: ver el runbook en deploy/DR.md (mongorestore).
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC diario (≈01:00 Colombia)
+  workflow_dispatch: {}  # permite lanzarlo a mano desde la pestaña Actions
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    name: mongodump → artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Instalar mongodump (mongodb-database-tools)
+        run: |
+          set -e
+          curl -sSLO https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.10.0.deb
+          sudo dpkg -i mongodb-database-tools-*.deb
+          mongodump --version | head -1
+
+      - name: Dump de la base 'battlecaos'
+        env:
+          MONGO_URL: ${{ secrets.MONGO_URL }}
+        run: |
+          set -e
+          if [ -z "$MONGO_URL" ]; then echo "::error::Falta el secret MONGO_URL"; exit 1; fi
+          mkdir -p backup
+          mongodump --uri="$MONGO_URL" --db=battlecaos --out=backup
+          echo "Colecciones respaldadas:"
+          ls -la backup/battlecaos/*.bson
+
+      - name: Subir el backup como artifact (retención 30 días)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongo-backup-${{ github.run_id }}
+          path: backup/
+          retention-days: 30

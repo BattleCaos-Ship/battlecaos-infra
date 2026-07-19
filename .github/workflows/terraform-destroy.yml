@@ -1,0 +1,64 @@
+name: Terraform Destroy — BattleCaos (manual, controlado)
+
+# Solo se dispara a mano (workflow_dispatch), nunca automático. Pide el ambiente
+# Y una confirmación escrita — dos candados antes de borrar infraestructura real.
+# Al igual que el deploy, pasa por el Environment de GitHub correspondiente, así
+# que si test/production tienen "Required reviewers" configurado, también hace
+# falta aprobación humana para destruirlos.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente a destruir"
+        required: true
+        type: choice
+        options: [dev, test, prod]
+      confirmacion:
+        description: 'Escribe exactamente "destruir-<ambiente>" para confirmar (ej. destruir-dev)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: "1.15.8"
+  TF_VAR_redis_url: ${{ secrets.REDIS_URL }}
+  TF_VAR_mongo_url: ${{ secrets.MONGO_URL }}
+  TF_VAR_jwt_secret: ${{ secrets.JWT_SECRET }}
+  TF_VAR_google_client_id: ${{ secrets.GOOGLE_CLIENT_ID }}
+
+jobs:
+  confirmar:
+    name: verificar confirmación
+    runs-on: ubuntu-latest
+    steps:
+      - name: comparar el texto de confirmación
+        run: |
+          esperado="destruir-${{ inputs.environment }}"
+          if [ "${{ inputs.confirmacion }}" != "$esperado" ]; then
+            echo "::error::Escribiste '${{ inputs.confirmacion }}', se esperaba '$esperado'. Cancelado."
+            exit 1
+          fi
+          echo "Confirmación correcta — procediendo a destruir '${{ inputs.environment }}'."
+
+  destroy:
+    name: destroy · ${{ inputs.environment }}
+    needs: confirmar
+    runs-on: ubuntu-latest
+    # production→dev en la nomenclatura de Environments; test y dev iguales al resto.
+    environment: ${{ inputs.environment == 'prod' && 'production' || inputs.environment }}
+    defaults: { run: { working-directory: terraform } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: ${{ env.TF_VERSION }} }
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - run: terraform init -backend-config=environments/${{ inputs.environment }}.backend.hcl
+      - run: terraform destroy -auto-approve -var-file=environments/${{ inputs.environment }}.tfvars
