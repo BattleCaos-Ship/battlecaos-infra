@@ -21,6 +21,13 @@ on:
         required: false
         type: string
         default: "20"
+    # Los repos que llaman deben pasar SOLO estos secrets (nunca `secrets: inherit`,
+    # que expone todos los secrets del repo a este workflow — regla Sonar S7635).
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
 
 permissions:
   contents: read
@@ -64,7 +71,8 @@ jobs:
 
       - name: Análisis SonarQube
         if: steps.sonar.outputs.on == 'true'
-        uses: SonarSource/sonarqube-scan-action@v3
+        # Anclado a SHA de commit (inmutable) — un tag como v3 puede ser movido (Sonar S7637)
+        uses: SonarSource/sonarqube-scan-action@13990a695682794b53148ff9f6a8b6e22e43955e # v3.1.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
