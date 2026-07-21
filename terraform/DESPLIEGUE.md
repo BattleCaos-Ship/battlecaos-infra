@@ -59,9 +59,9 @@ imágenes Docker de cada microservicio** (§E).
 
 | Recurso | URL / nombre |
 |---|---|
-| **Frontend (el juego)** | https://battlecaosdev-frontend.victoriousriver-7e24b629.eastus2.azurecontainerapps.io |
-| Gateway (WebSocket) | https://battlecaosdev-gateway.victoriousriver-7e24b629.eastus2.azurecontainerapps.io |
-| Auth (login) | https://battlecaosdev-auth.victoriousriver-7e24b629.eastus2.azurecontainerapps.io |
+| **Frontend (el juego)** | https://battlecaosdev-frontend.orangeforest-5c4090bc.eastus2.azurecontainerapps.io |
+| Gateway (WebSocket) | https://battlecaosdev-gateway.orangeforest-5c4090bc.eastus2.azurecontainerapps.io |
+| Auth (login) | https://battlecaosdev-auth.orangeforest-5c4090bc.eastus2.azurecontainerapps.io |
 | ACR | `battlecaosdevacr52f56b.azurecr.io` |
 | Internos | kafka, redis, room, game, chat, timer, bot, observability |
 
@@ -389,6 +389,21 @@ Verificadas con `az ad app federated-credential list` — 13 en total (4 de
 ---
 
 ## Comandos de referencia (init / validate / plan / apply / destroy)
+
+> ### ⛔ NUNCA corras `terraform apply` sin `-var-file`
+>
+> El `-var-file=environments/<env>.tfvars` **no es opcional**: ahí vive `prefix`
+> (`battlecaosdev`). Sin él, `prefix` cae a su default `"battlecaos"`, **cambia el `name` de
+> TODOS los recursos**, y como el nombre *forces replacement*, Terraform **destruye y recrea el
+> ambiente entero** — incluido el ACR con todas las imágenes. Pasó de verdad el 2026-07-19:
+> se perdió `battlecaosdevacr52f56b` y hubo que reconstruir las 10 imágenes desde cero.
+> (También caen a default `deploy_frontend`, `gateway_replicas` e `image_tag`.)
+>
+> **Señal de alarma al leer el plan**: si dice `must be replaced` sobre
+> `azurerm_resource_group.rg` o `azurerm_container_registry.acr` → **aborta, te falta el
+> `-var-file`**. Un cambio normal nunca toca el resource group.
+>
+> Si ya ocurrió, la reparación está automatizada en `tools\reparar-dev.ps1` (raíz del proyecto).
 
 ```powershell
 terraform init -backend-config=environments/<env>.backend.hcl   # descarga providers + conecta al backend remoto

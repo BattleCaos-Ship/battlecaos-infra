@@ -34,6 +34,10 @@ resource "azurerm_storage_account" "kafka" {
   location                 = azurerm_resource_group.rg.location
   account_tier             = "Standard"
   account_replication_type = "LRS"
+
+  identity {
+    type = "SystemAssigned"
+  }
 }
 
 resource "azurerm_storage_share" "kafka" {

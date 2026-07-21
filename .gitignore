@@ -1,0 +1,3 @@
+
+# Backups descargados con `gh run download` (contienen datos reales de la BD).
+mongo-backup-*/

@@ -23,7 +23,9 @@ jobs:
       - name: Instalar mongodump (mongodb-database-tools)
         run: |
           set -e
-          curl -sSLO https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.10.0.deb
+          # --proto '=https': si el servidor respondiera con una redirección a http://, curl
+          # aborta en vez de descargar el .deb por un canal sin cifrar (se instala con dpkg).
+          curl -sSLO --proto '=https' --tlsv1.2 https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.10.0.deb
           sudo dpkg -i mongodb-database-tools-*.deb
           mongodump --version | head -1
 
