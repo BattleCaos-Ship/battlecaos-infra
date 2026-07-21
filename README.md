@@ -1,3 +1,5 @@
 # battlecaos-infra
 
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=BattleCaos-Ship_battlecaos-infra&metric=alert_status)](https://sonarcloud.io/summary/overall?id=BattleCaos-Ship_battlecaos-infra) [![Security](https://sonarcloud.io/api/project_badges/measure?project=BattleCaos-Ship_battlecaos-infra&metric=security_rating)](https://sonarcloud.io/summary/overall?id=BattleCaos-Ship_battlecaos-infra) [![Reliability](https://sonarcloud.io/api/project_badges/measure?project=BattleCaos-Ship_battlecaos-infra&metric=reliability_rating)](https://sonarcloud.io/summary/overall?id=BattleCaos-Ship_battlecaos-infra) [![Maintainability](https://sonarcloud.io/api/project_badges/measure?project=BattleCaos-Ship_battlecaos-infra&metric=sqale_rating)](https://sonarcloud.io/summary/overall?id=BattleCaos-Ship_battlecaos-infra)
+
 repositorio para infraestructura y despliegue con terraform

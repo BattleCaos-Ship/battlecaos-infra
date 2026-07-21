@@ -26,6 +26,18 @@ on:
         required: false
         type: string
         default: ""
+    # Los repos que llaman deben pasar SOLO estos secrets (nunca `secrets: inherit`,
+    # que expone todos los secrets del repo a este workflow — regla Sonar S7635).
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      GOOGLE_CLIENT_ID:
+        description: "Solo lo necesita el frontend (horneado en el build de Vite)"
+        required: false
 
 permissions:
   id-token: write
@@ -40,7 +52,8 @@ jobs:
 
       # La credencial federada de este servicio confía en
       # repo:BattleCaos-Ship/battlecaos-<service>:ref:refs/heads/main
-      - uses: azure/login@v2
+      # Anclado a SHA de commit (inmutable) — un tag como v2 puede ser movido (Sonar S7637)
+      - uses: azure/login@eec3c95657c1536435858eda1f3ff5437fee8474 # v2.3.0
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -82,6 +95,10 @@ jobs:
       # Azure for Students (error TasksOperationsNotAllowed), así que la imagen
       # se construye EN el runner con docker y se sube con push normal.
       - name: Construir y subir la imagen (docker build en el runner + push al ACR)
+        env:
+          # Los secrets NUNCA se interpolan dentro del script (Sonar S7636): como env var
+          # el shell no los expande en el texto del comando ni quedan en el log de Actions.
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
         run: |
           az acr login --name "${{ steps.acr.outputs.name }}"
 
@@ -89,7 +106,7 @@ jobs:
           if [ "${{ inputs.service }}" = "frontend" ]; then
             ARGS+=(--build-arg "VITE_GATEWAY_URL=${{ steps.urls.outputs.gateway-url }}")
             ARGS+=(--build-arg "VITE_AUTH_URL=${{ steps.urls.outputs.auth-url }}")
-            ARGS+=(--build-arg "VITE_GOOGLE_CLIENT_ID=${{ secrets.GOOGLE_CLIENT_ID }}")
+            ARGS+=(--build-arg "VITE_GOOGLE_CLIENT_ID=$GOOGLE_CLIENT_ID")
           fi
           while IFS= read -r line; do
             [ -n "$line" ] && ARGS+=(--build-arg "$line")
